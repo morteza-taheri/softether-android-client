@@ -4,6 +4,7 @@ import android.util.Log
 import vn.unlimit.softether.model.ConnectionException
 import vn.unlimit.softether.model.SoftEtherError
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.locks.ReentrantLock
 
 /**
  * SoftEtherClient - JNI bridge wrapper to native SoftEther implementation
@@ -14,13 +15,84 @@ class SoftEtherClient {
     private val tag = "SoftEtherClient"
     private var nativeHandle: Long = 0
     private val isConnected = AtomicBoolean(false)
-    
+
     // External handle set by ConnectionController when it manages the native connection directly
     @Volatile
     var externalHandle: Long = 0
 
+    /**
+     * Serializes every JNI call that consumes the externally-managed handle
+     * with the teardown path. Without this, the data/health loops can drag a
+     * handle into native exactly while destroyExternalConnection() is freeing
+     * it (use-after-free SIGSEGV at the JNI boundary, fault addr ~0x20 on the
+     * forwarding thread during a manual disconnect of a fully CONNECTED
+     * multi-connection session).
+     */
+    private val externalLock = ReentrantLock()
+
     init {
         System.loadLibrary("softether")
+    }
+
+    /**
+     * Perform an arbitrary JNI call on the externally-managed handle under
+     * [externalLock]. ConnectionController uses this for the wide-signature
+     * calls (nativeConnectWithHub, ...) so teardown can never interleave
+     * with an in-flight call on the same handle.
+     */
+    fun <T> withExternalLock(action: () -> T): T {
+        externalLock.lock()
+        try {
+            return action()
+        } finally {
+            externalLock.unlock()
+        }
+    }
+
+    /**
+     * Atomically retire and destroy the externally-managed connection.
+     *
+     * The external handle is cleared and the native object destroyed under
+     * [externalLock], so no concurrent send/receive/getStats call can be
+     * inside native with this handle while it is being freed. Callers must
+     * NOT touch `externalHandle` or call `nativeDestroy` themselves.
+     *
+     * @return true when a live external handle was retired here.
+     */
+    fun destroyExternalConnection(): Boolean {
+        externalLock.lock()
+        try {
+            val handle = externalHandle
+            if (handle == 0L) return false
+            externalHandle = 0
+            try {
+                nativeDisconnect(handle)
+            } catch (e: Exception) {
+                Log.e(tag, "nativeDisconnect during external teardown failed", e)
+            }
+            try {
+                nativeDestroy(handle)
+            } catch (e: Exception) {
+                Log.e(tag, "nativeDestroy during external teardown failed", e)
+            }
+            return true
+        } finally {
+            externalLock.unlock()
+        }
+    }
+
+    /**
+     * Force-close all sockets of a handle under [externalLock]: interrupts a
+     * blocking connect without racing an in-flight stats/send/receive call.
+     */
+    fun forceCloseExternalSocket(handle: Long) {
+        if (handle == 0L) return
+        externalLock.lock()
+        try {
+            nativeForceCloseSocket(handle)
+        } finally {
+            externalLock.unlock()
+        }
     }
 
     /**
@@ -148,8 +220,14 @@ class SoftEtherClient {
      * @return Number of active connections
      */
     fun getNumConnections(): Int {
-        if (nativeHandle == 0L) return 0
-        return nativeGetNumConnections(nativeHandle)
+        externalLock.lock()
+        try {
+            val handle = externalHandle.takeIf { it != 0L } ?: nativeHandle
+            if (handle == 0L) return 0
+            return nativeGetNumConnections(handle)
+        } finally {
+            externalLock.unlock()
+        }
     }
 
     /**
@@ -157,8 +235,14 @@ class SoftEtherClient {
      * @return Array of socket FDs, or null if none
      */
     fun getAllSocketFds(): IntArray? {
-        if (nativeHandle == 0L) return null
-        return nativeGetAllSocketFds(nativeHandle)
+        externalLock.lock()
+        try {
+            val handle = externalHandle.takeIf { it != 0L } ?: nativeHandle
+            if (handle == 0L) return null
+            return nativeGetAllSocketFds(handle)
+        } finally {
+            externalLock.unlock()
+        }
     }
 
     /**
@@ -183,9 +267,14 @@ class SoftEtherClient {
      * @return Number of bytes sent, or -1 on error
      */
     fun send(data: ByteArray): Int {
-        val handle = externalHandle.takeIf { it != 0L } ?: nativeHandle
-        if (handle == 0L) return -1
-        return nativeSend(handle, data, data.size)
+        externalLock.lock()
+        try {
+            val handle = externalHandle.takeIf { it != 0L } ?: nativeHandle
+            if (handle == 0L) return -1
+            return nativeSend(handle, data, data.size)
+        } finally {
+            externalLock.unlock()
+        }
     }
 
     /**
@@ -195,9 +284,14 @@ class SoftEtherClient {
      * @return Number of bytes sent, or -1 on error
      */
     fun send(buffer: ByteArray, offset: Int, length: Int): Int {
-        val handle = externalHandle.takeIf { it != 0L } ?: nativeHandle
-        if (handle == 0L) return -1
-        return nativeSendSlice(handle, buffer, offset, length)
+        externalLock.lock()
+        try {
+            val handle = externalHandle.takeIf { it != 0L } ?: nativeHandle
+            if (handle == 0L) return -1
+            return nativeSendSlice(handle, buffer, offset, length)
+        } finally {
+            externalLock.unlock()
+        }
     }
 
     /**
@@ -207,9 +301,14 @@ class SoftEtherClient {
      * @return Number of bytes received, 0 for keepalive, or -1 on error
      */
     fun receive(buffer: ByteArray): Int {
-        val handle = externalHandle.takeIf { it != 0L } ?: nativeHandle
-        if (handle == 0L) return -1
-        return nativeReceive(handle, buffer, buffer.size)
+        externalLock.lock()
+        try {
+            val handle = externalHandle.takeIf { it != 0L } ?: nativeHandle
+            if (handle == 0L) return -1
+            return nativeReceive(handle, buffer, buffer.size)
+        } finally {
+            externalLock.unlock()
+        }
     }
 
     /**
@@ -221,9 +320,14 @@ class SoftEtherClient {
      * @return Total bytes written into buffer (0 = nothing available), or -1 on error
      */
     fun receiveBatch(buffer: ByteArray, lengths: IntArray): Int {
-        val handle = externalHandle.takeIf { it != 0L } ?: nativeHandle
-        if (handle == 0L) return -1
-        return nativeReceiveBatch(handle, buffer, buffer.size, lengths, lengths.size)
+        externalLock.lock()
+        try {
+            val handle = externalHandle.takeIf { it != 0L } ?: nativeHandle
+            if (handle == 0L) return -1
+            return nativeReceiveBatch(handle, buffer, buffer.size, lengths, lengths.size)
+        } finally {
+            externalLock.unlock()
+        }
     }
 
     /**
@@ -232,21 +336,26 @@ class SoftEtherClient {
      * @return Snapshot of native counters, or null when disconnected
      */
     fun getStats(): NativeStats? {
-        val handle = externalHandle.takeIf { it != 0L } ?: nativeHandle
-        if (handle == 0L) return null
-        val arr = nativeGetStats(handle) ?: return null
-        if (arr.size < 9) return null
-        return NativeStats(
-            txPackets = arr[0],
-            txBytes = arr[1],
-            rxPackets = arr[2],
-            rxBytes = arr[3],
-            rxSkippedBlocks = arr[4],
-            rudpOverflowCount = arr[5],
-            rudpRxPackets = arr[6],
-            rudpTickGaps = arr[7],
-            rudpDataSuspended = arr[8] != 0L
-        )
+        externalLock.lock()
+        try {
+            val handle = externalHandle.takeIf { it != 0L } ?: nativeHandle
+            if (handle == 0L) return null
+            val arr = nativeGetStats(handle) ?: return null
+            if (arr.size < 9) return null
+            return NativeStats(
+                txPackets = arr[0],
+                txBytes = arr[1],
+                rxPackets = arr[2],
+                rxBytes = arr[3],
+                rxSkippedBlocks = arr[4],
+                rudpOverflowCount = arr[5],
+                rudpRxPackets = arr[6],
+                rudpTickGaps = arr[7],
+                rudpDataSuspended = arr[8] != 0L
+            )
+        } finally {
+            externalLock.unlock()
+        }
     }
 
     /**

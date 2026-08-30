@@ -101,7 +101,7 @@ class ConnectionController(
         val handle = nativeHandle
         if (handle != 0L) {
             try {
-                client.nativeDisconnect(handle)
+                client.withExternalLock { client.nativeDisconnect(handle) }
             } catch (e: Exception) {
                 Log.e(TAG, "Error interrupting native connection", e)
             }
@@ -284,6 +284,9 @@ class ConnectionController(
      * Only called from the connect flow itself or when no connect is in flight.
      */
     private fun teardownNativeConnection() {
+        // Retire the mirrored external handle first (atomic with the destroy
+        // under the client's externalLock) so no data/stats loop can enter
+        // native with this handle while it is being freed.
         client.externalHandle = 0
         val handle = nativeHandle
         nativeHandle = 0
@@ -291,8 +294,10 @@ class ConnectionController(
 
         try {
             Log.d(TAG, "Tearing down native handle $handle")
-            client.nativeDisconnect(handle)
-            client.nativeDestroy(handle)
+            client.withExternalLock {
+                client.nativeDisconnect(handle)
+                client.nativeDestroy(handle)
+            }
             Log.d(TAG, "Native handle $handle torn down")
         } catch (e: Exception) {
             Log.e(TAG, "Error tearing down native handle", e)
@@ -363,6 +368,9 @@ class ConnectionController(
         // Build client info (rudpPort will be filled in by native code during RUDP init)
         val clientInfo = buildClientInfo(0)
         val result = try {
+            // NOT under externalLock: a user cancel must be able to
+            // force-close the socket mid-connect (connectInFlight makes
+            // teardown defer to this flow instead of racing it).
             client.nativeConnectWithHub(
                 nativeHandle,
                 config.serverHost,
@@ -416,7 +424,7 @@ class ConnectionController(
         }
 
         // Protect VPN socket from routing through TUN (prevents routing loop)
-        val socketFd = client.nativeGetSocketFd(nativeHandle)
+        val socketFd = client.withExternalLock { client.nativeGetSocketFd(nativeHandle) }
         if (socketFd >= 0) {
             if (!service.protect(socketFd)) {
                 Log.e(TAG, "Failed to protect VPN socket fd=$socketFd")
@@ -428,7 +436,7 @@ class ConnectionController(
         }
 
         // Also protect RUDP UDP socket from routing through TUN (prevents RUDP routing loop)
-        val rudpFd = client.nativeGetRudpSocketFd(nativeHandle)
+        val rudpFd = client.withExternalLock { client.nativeGetRudpSocketFd(nativeHandle) }
         if (rudpFd >= 0) {
             if (!service.protect(rudpFd)) {
                 Log.e(TAG, "Failed to protect RUDP socket fd=$rudpFd")
@@ -439,7 +447,7 @@ class ConnectionController(
 
         // Protect NAT-T RUDP transport UDP socket (used when the primary
         // connection runs over the NAT-T fallback; -1 otherwise)
-        val natTUdpFd = client.nativeGetNatTUdpSocketFd(nativeHandle)
+        val natTUdpFd = client.withExternalLock { client.nativeGetNatTUdpSocketFd(nativeHandle) }
         if (natTUdpFd >= 0) {
             if (!service.protect(natTUdpFd)) {
                 Log.e(TAG, "Failed to protect NAT-T UDP socket fd=$natTUdpFd")
@@ -450,7 +458,7 @@ class ConnectionController(
 
         // Perform DHCP over the SoftEther tunnel to get IP configuration
         Log.d(TAG, "Starting DHCP over SoftEther tunnel...")
-        val dhcpResult = client.doDhcp(nativeHandle)
+        val dhcpResult = client.withExternalLock { client.doDhcp(nativeHandle) }
 
         // Re-check after DHCP: if the user cancelled while doDhcp() was
         // blocking, stop here — never establish the system VPN interface
@@ -619,7 +627,7 @@ class ConnectionController(
         nativeHandle = 0
         if (handle != 0L) {
             try {
-                client.nativeForceCloseSocket(handle)
+                client.forceCloseExternalSocket(handle)
             } catch (e: Exception) {
                 Log.e(TAG, "Error force-closing socket", e)
             }
@@ -630,7 +638,7 @@ class ConnectionController(
             } catch (_: InterruptedException) {}
 
             try {
-                client.nativeDestroy(handle)
+                client.withExternalLock { client.nativeDestroy(handle) }
             } catch (e: Exception) {
                 Log.e(TAG, "Error destroying native handle", e)
             }
@@ -821,8 +829,10 @@ class ConnectionController(
                 val handle = nativeHandle
                 nativeHandle = 0
                 try {
-                    client.nativeDisconnect(handle)
-                    client.nativeDestroy(handle)
+                    client.withExternalLock {
+                        client.nativeDisconnect(handle)
+                        client.nativeDestroy(handle)
+                    }
                 } catch (e: Exception) {
                     Log.e(TAG, "Error disconnecting old native handle", e)
                 }
@@ -894,13 +904,15 @@ class ConnectionController(
             if (isCancelled.get()) {
                 val handle = nativeHandle
                 nativeHandle = 0
-                client.nativeDisconnect(handle)
-                client.nativeDestroy(handle)
+                client.withExternalLock {
+                    client.nativeDisconnect(handle)
+                    client.nativeDestroy(handle)
+                }
                 return
             }
 
             // Protect VPN socket from routing through TUN
-            val socketFd = client.nativeGetSocketFd(nativeHandle)
+            val socketFd = client.withExternalLock { client.nativeGetSocketFd(nativeHandle) }
             if (socketFd >= 0) {
                 if (!service.protect(socketFd)) {
                     Log.e(TAG, "Failed to protect VPN socket fd=$socketFd during reconnect")
@@ -910,7 +922,7 @@ class ConnectionController(
             }
 
             // Protect RUDP UDP socket
-            val rudpFd = client.nativeGetRudpSocketFd(nativeHandle)
+            val rudpFd = client.withExternalLock { client.nativeGetRudpSocketFd(nativeHandle) }
             if (rudpFd >= 0) {
                 if (!service.protect(rudpFd)) {
                     Log.e(TAG, "Failed to protect RUDP socket fd=$rudpFd during reconnect")
@@ -920,7 +932,7 @@ class ConnectionController(
             }
 
             // Protect NAT-T RUDP transport UDP socket during reconnect
-            val natTUdpFd = client.nativeGetNatTUdpSocketFd(nativeHandle)
+            val natTUdpFd = client.withExternalLock { client.nativeGetNatTUdpSocketFd(nativeHandle) }
             if (natTUdpFd >= 0) {
                 if (!service.protect(natTUdpFd)) {
                     Log.e(TAG, "Failed to protect NAT-T UDP socket fd=$natTUdpFd during reconnect")
@@ -933,7 +945,7 @@ class ConnectionController(
 
             // Perform DHCP over the new tunnel
             Log.d(TAG, "Starting DHCP over reconnected tunnel...")
-            val dhcpResult = client.doDhcp(nativeHandle)
+            val dhcpResult = client.withExternalLock { client.doDhcp(nativeHandle) }
             if (dhcpResult != null) {
                 Log.d(TAG, "DHCP success on reconnect: IP=${dhcpResult.assignedIp}/${dhcpResult.prefixLength}")
                 assignedLocalIp = dhcpResult.assignedIp
@@ -968,8 +980,10 @@ class ConnectionController(
                 val handle = nativeHandle
                 nativeHandle = 0
                 try {
-                    client.nativeDisconnect(handle)
-                    client.nativeDestroy(handle)
+                    client.withExternalLock {
+                        client.nativeDisconnect(handle)
+                        client.nativeDestroy(handle)
+                    }
                 } catch (ex: Exception) {
                     Log.e(TAG, "Error cleaning up failed reconnect handle", ex)
                 }
@@ -1099,7 +1113,11 @@ class ConnectionController(
             var lastBroadcastTime = 0L
             while (!isCancelled.get() && nativeHandle != 0L) {
                 try {
-                    val mapped = mapNativeState(client.nativeGetState(nativeHandle))
+                    val handle = nativeHandle
+                    if (handle == 0L) break
+                    val mapped = mapNativeState(
+                        client.withExternalLock { client.nativeGetState(handle) }
+                    )
                     if (mapped != null &&
                         mapped != ConnectionState.DISCONNECTED &&
                         mapped != ConnectionState.CONNECTED &&
@@ -1155,7 +1173,9 @@ class ConnectionController(
      */
     private fun protectAdditionalSockets() {
         val allFds = client.getAllSocketFds() ?: return
-        val natTUdpFd = client.nativeGetNatTUdpSocketFd(nativeHandle)
+        val natTUdpFd = client.withExternalLock {
+            if (nativeHandle == 0L) -1 else client.nativeGetNatTUdpSocketFd(nativeHandle)
+        }
         for (fd in allFds) {
             if (fd >= 0 && fd !in protectedFds) {
                 if (service.protect(fd)) {
