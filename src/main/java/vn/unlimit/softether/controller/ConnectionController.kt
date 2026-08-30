@@ -336,6 +336,14 @@ class ConnectionController(
             Log.d(TAG, "UDP-only server: skipping direct TCP attempt")
         }
 
+        // User-tunable multi-connection fan-out: must be set BEFORE the login
+        // PACK is sent (nativeConnectWithHub), otherwise the server learns the
+        // default target only. Corrupt/legacy values fall back to the
+        // historical runtime default of 4 (softether_protocol.c init).
+        val maxConnections = if (config.maxConnections in 1..8) config.maxConnections else 4
+        client.nativeSetMaxConnection(nativeHandle, maxConnections)
+        Log.d(TAG, "[SoftEther] Max connections: $maxConnections")
+
         currentState = ConnectionState.TLS_HANDSHAKE
 
         // Connect to server with hub name (includes TLS handshake, protocol handshake, auth, session setup)

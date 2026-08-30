@@ -47,7 +47,10 @@ data class ConnectionConfig(
     val authMethod: AuthMethod = AuthMethod.AUTO,
     val clientProductName: String = "VPN Gate Connector",
     val clientVersion: String = "1.0.0",
-    val clientBuild: Int = 1
+    val clientBuild: Int = 1,
+    // Target number of concurrent TCP connections requested in the login PACK
+    // (native MAX_SE_CONNECTIONS = 8; default 4 preserves the original runtime behavior)
+    val maxConnections: Int = 4
 ) : Parcelable {
 
     constructor(parcel: Parcel) : this(
@@ -81,7 +84,8 @@ data class ConnectionConfig(
         authMethod = AuthMethod.valueOf(parcel.readString() ?: AuthMethod.AUTO.name),
         clientProductName = parcel.readString() ?: "VPN Gate Connector",
         clientVersion = parcel.readString() ?: "1.0.0",
-        clientBuild = parcel.readInt()
+        clientBuild = parcel.readInt(),
+        maxConnections = parcel.readInt()
     )
 
     override fun writeToParcel(parcel: Parcel, flags: Int) {
@@ -116,6 +120,7 @@ data class ConnectionConfig(
         parcel.writeString(clientProductName)
         parcel.writeString(clientVersion)
         parcel.writeInt(clientBuild)
+        parcel.writeInt(maxConnections)
     }
 
     override fun describeContents(): Int = 0
