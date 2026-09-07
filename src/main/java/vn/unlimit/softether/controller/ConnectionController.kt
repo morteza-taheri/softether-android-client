@@ -478,12 +478,15 @@ class ConnectionController(
             Log.d(TAG, "DHCP success: IP=${dhcpResult.assignedIp}/${dhcpResult.prefixLength} " +
                     "GW=${dhcpResult.gateway} DNS=${dhcpResult.dnsServer} DNS2=${dhcpResult.dnsServer2}")
             assignedLocalIp = dhcpResult.assignedIp
-            // Update config with DHCP-assigned values
+            // Update config with DHCP-assigned values.
+            // DNS: keep the app-configured public resolvers (8.8.8.8 / 8.8.4.4)
+            // instead of adopting the VPN Gate SecureNAT internal relay
+            // (e.g. 10.240.254.254). Those relays are frequently broken or
+            // blocked, which manifests as "tunnel connected but no internet".
+            // The DHCP IP/prefix is still honoured for the TUN interface.
             dhcpConfig = config.copy(
                 localAddress = dhcpResult.assignedIp,
                 prefixLength = dhcpResult.prefixLength,
-                dnsServer = if (dhcpResult.dnsServer != "0.0.0.0") dhcpResult.dnsServer else config.dnsServer,
-                secondaryDnsServer = if (dhcpResult.dnsServer2 != "0.0.0.0") dhcpResult.dnsServer2 else config.secondaryDnsServer
             )
             vpnInterface = service.establishVpnInterface(dhcpConfig)
                 ?: throw Exception("Failed to establish VPN interface")
@@ -960,11 +963,10 @@ class ConnectionController(
             if (dhcpResult != null) {
                 Log.d(TAG, "DHCP success on reconnect: IP=${dhcpResult.assignedIp}/${dhcpResult.prefixLength}")
                 assignedLocalIp = dhcpResult.assignedIp
+                // DNS: keep the app-configured public resolvers (see primary connect path).
                 val dhcpConfig = config.copy(
                     localAddress = dhcpResult.assignedIp,
                     prefixLength = dhcpResult.prefixLength,
-                    dnsServer = if (dhcpResult.dnsServer != "0.0.0.0") dhcpResult.dnsServer else config.dnsServer,
-                    secondaryDnsServer = if (dhcpResult.dnsServer2 != "0.0.0.0") dhcpResult.dnsServer2 else config.secondaryDnsServer
                 )
                 vpnInterface = service.establishVpnInterface(dhcpConfig)
                     ?: throw Exception("Failed to establish VPN interface during reconnect")
